@@ -134,6 +134,11 @@ jobs:
     if: always()
     outputs:
       score: ${{ steps.compute.outputs.score }}
+    env:
+      GITLEAKS_STATUS: ${{ needs.gitleaks.result }}
+      TRIVY_FS_STATUS: ${{ needs.trivy-fs.result }}
+      TRIVY_DOCKER_STATUS: ${{ needs.trivy-docker.result }}
+      SEMGREP_STATUS: ${{ needs.semgrep.result }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -249,11 +254,44 @@ jobs:
           elif score >= 30:  color, emoji, label = "orange", "🟠", "À améliorer"
           else:              color, emoji, label = "red", "🔴", "Critique"
 
+          # Vérifier la fiabilité du score (un scanner planté = score non fiable)
+          job_status = {
+              "Gitleaks": os.environ.get("GITLEAKS_STATUS", "unknown"),
+              "Trivy FS": os.environ.get("TRIVY_FS_STATUS", "unknown"),
+              "Trivy Docker": os.environ.get("TRIVY_DOCKER_STATUS", "unknown"),
+              "Semgrep": os.environ.get("SEMGREP_STATUS", "unknown"),
+          }
+          # 'success' ou 'skipped' (skipped = scan-docker désactivé) = OK
+          # 'failure' ou 'cancelled' = scan a planté → score non fiable
+          failed_jobs = [name for name, st in job_status.items() if st in ("failure", "cancelled")]
+          reliable = len(failed_jobs) == 0
+
+          if not reliable:
+              # Override : on n'affiche pas un score crédible si des scans ont planté
+              emoji = "⚠️"
+              label = f"INCOMPLET — scans en échec : {', '.join(failed_jobs)}"
+              color = "lightgrey"
+
           # GitHub summary
           summary = os.environ["GITHUB_STEP_SUMMARY"]
           with open(summary, "w", encoding="utf-8") as s:
-              s.write(f"# {emoji} Score sécurité : **{score}/100** — {label}\n\n")
-              s.write(f"![score](https://img.shields.io/badge/security-{score}%2F100-{color})\n\n")
+              if reliable:
+                  s.write(f"# {emoji} Score sécurité : **{score}/100** — {label}\n\n")
+                  s.write(f"![score](https://img.shields.io/badge/security-{score}%2F100-{color})\n\n")
+              else:
+                  s.write(f"# ⚠️ Score non fiable — analyse incomplète\n\n")
+                  s.write(f"**Scanners en échec** : {', '.join(failed_jobs)}.\n\n")
+                  s.write(f"Le score brut serait {score}/100 mais ne reflète pas la réalité car ces scanners n'ont pas pu produire de résultats. ")
+                  s.write(f"Vérifie l'onglet **Actions** pour comprendre l'erreur, puis relance.\n\n")
+                  s.write(f"![score](https://img.shields.io/badge/security-incomplet-lightgrey)\n\n")
+
+              # Statut des scanners
+              s.write("## Statut des scanners\n\n")
+              s.write("| Scanner | Statut |\n|---|---|\n")
+              status_emoji = {"success": "✅", "skipped": "⏭️", "failure": "❌", "cancelled": "🚫", "unknown": "❓"}
+              for name, st in job_status.items():
+                  s.write(f"| {name} | {status_emoji.get(st, '❓')} {st} |\n")
+              s.write("\n")
 
               s.write("## Findings par sévérité\n\n")
               s.write("```mermaid\n")

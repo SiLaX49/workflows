@@ -149,47 +149,94 @@ jobs:
           import json, os, glob
 
           WEIGHTS = {"CRITICAL": 10, "HIGH": 5, "MEDIUM": 2, "LOW": 0.5}
+          SEV_RANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+          SEV_EMOJI = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵"}
           counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
           per_tool = {}
+          findings = []  # list of dicts: tool, severity, location, problem, fix
 
-          def add(tool, sev, n=1):
+          def add(tool, sev, location="", problem="", fix=""):
               sev = sev.upper()
-              if sev in counts:
-                  counts[sev] += n
-                  per_tool.setdefault(tool, {"CRITICAL":0,"HIGH":0,"MEDIUM":0,"LOW":0})[sev] += n
+              if sev not in counts:
+                  return
+              counts[sev] += 1
+              per_tool.setdefault(tool, {"CRITICAL":0,"HIGH":0,"MEDIUM":0,"LOW":0})[sev] += 1
+              findings.append({
+                  "tool": tool, "severity": sev,
+                  "location": location or "—",
+                  "problem": (problem or "")[:120],
+                  "fix": (fix or "")[:120],
+              })
 
-          # Trivy FS
+          # Trivy FS — vulns dans les deps + misconfig (Dockerfile, IaC...)
           for f in glob.glob("reports/trivy-fs-report/trivy-fs.json"):
               try:
                   data = json.load(open(f))
                   for r in data.get("Results", []) or []:
+                      target = r.get("Target", "?")
                       for v in r.get("Vulnerabilities", []) or []:
-                          add("Trivy FS", v.get("Severity", "LOW"))
+                          loc = f"{target} → {v.get('PkgName','?')} {v.get('InstalledVersion','')}"
+                          prob = f"{v.get('VulnerabilityID','?')} — {v.get('Title') or v.get('Description','')}"
+                          fix = f"Mettre à jour vers {v.get('FixedVersion','(pas de fix)')}"
+                          add("Trivy FS", v.get("Severity","LOW"), loc, prob, fix)
                       for m in r.get("Misconfigurations", []) or []:
-                          add("Trivy FS", m.get("Severity", "LOW"))
+                          loc = f"{target}:{(m.get('CauseMetadata') or {}).get('StartLine','?')}"
+                          prob = f"{m.get('ID','?')} — {m.get('Title','')}"
+                          fix = m.get("Resolution","")
+                          add("Trivy FS", m.get("Severity","LOW"), loc, prob, fix)
               except Exception as e:
                   print(f"trivy-fs parse error: {e}")
 
-          # Trivy Docker
+          # Trivy Docker — CVE OS / libs dans l'image
           for f in glob.glob("reports/trivy-docker-report/trivy-docker.json"):
               try:
                   data = json.load(open(f))
                   for r in data.get("Results", []) or []:
+                      target = r.get("Target", "image")
                       for v in r.get("Vulnerabilities", []) or []:
-                          add("Trivy Docker", v.get("Severity", "LOW"))
+                          loc = f"{v.get('PkgName','?')} {v.get('InstalledVersion','')} (image)"
+                          prob = f"{v.get('VulnerabilityID','?')} — {v.get('Title') or v.get('Description','')}"
+                          fix = f"Mettre à jour vers {v.get('FixedVersion','(pas de fix)')}"
+                          add("Trivy Docker", v.get("Severity","LOW"), loc, prob, fix)
               except Exception as e:
                   print(f"trivy-docker parse error: {e}")
 
-          # Semgrep (ERROR=HIGH, WARNING=MEDIUM, INFO=LOW)
+          # Semgrep — SAST avec fichier:ligne
           sev_map = {"ERROR": "HIGH", "WARNING": "MEDIUM", "INFO": "LOW"}
           for f in glob.glob("reports/semgrep-report/semgrep.json"):
               try:
                   data = json.load(open(f))
                   for res in data.get("results", []) or []:
-                      sev = sev_map.get(res.get("extra", {}).get("severity", "INFO"), "LOW")
-                      add("Semgrep", sev)
+                      sev = sev_map.get(res.get("extra",{}).get("severity","INFO"), "LOW")
+                      loc = f"{res.get('path','?')}:{(res.get('start') or {}).get('line','?')}"
+                      check = res.get("check_id","?").split(".")[-1]
+                      msg = (res.get("extra") or {}).get("message","")
+                      prob = f"{check} — {msg}"
+                      fix = (res.get("extra") or {}).get("fix") or "Voir doc Semgrep"
+                      add("Semgrep", sev, loc, prob, fix)
               except Exception as e:
                   print(f"semgrep parse error: {e}")
+
+          # Gitleaks — secrets exposés (artefact "results.sarif" ou "gitleaks-report.json")
+          for f in glob.glob("reports/**/gitleaks*.json", recursive=True) + glob.glob("reports/**/results.sarif", recursive=True):
+              try:
+                  data = json.load(open(f))
+                  if isinstance(data, list):
+                      for r in data:
+                          loc = f"{r.get('File','?')}:{r.get('StartLine','?')}"
+                          prob = f"{r.get('RuleID','?')} — secret détecté"
+                          add("Gitleaks", "CRITICAL", loc, prob, "Révoquer le secret + git history rewrite (BFG)")
+                  elif "runs" in data:  # SARIF
+                      for run in data["runs"]:
+                          for r in run.get("results", []) or []:
+                              locs = r.get("locations") or [{}]
+                              pl = (locs[0].get("physicalLocation") or {})
+                              file = (pl.get("artifactLocation") or {}).get("uri","?")
+                              line = (pl.get("region") or {}).get("startLine","?")
+                              prob = f"{r.get('ruleId','?')} — {(r.get('message') or {}).get('text','secret')}"
+                              add("Gitleaks", "CRITICAL", f"{file}:{line}", prob, "Révoquer + nettoyer historique")
+              except Exception as e:
+                  print(f"gitleaks parse error on {f}: {e}")
 
           # Score
           score = 100.0
@@ -225,9 +272,29 @@ jobs:
                   s.write(f"| {tool} | {c['CRITICAL']} | {c['HIGH']} | {c['MEDIUM']} | {c['LOW']} |\n")
               s.write(f"| **TOTAL** | **{counts['CRITICAL']}** | **{counts['HIGH']}** | **{counts['MEDIUM']}** | **{counts['LOW']}** |\n\n")
 
+              # Top findings triés par sévérité
+              findings.sort(key=lambda x: SEV_RANK[x["severity"]])
+              top = findings[:25]
+              if top:
+                  s.write("## 🎯 Top findings (où sont les problèmes)\n\n")
+                  s.write("| | Outil | Emplacement | Problème | Comment fixer |\n")
+                  s.write("|---|---|---|---|---|\n")
+                  for fnd in top:
+                      sev = fnd["severity"]
+                      emoji = SEV_EMOJI[sev]
+                      loc = fnd["location"].replace("|", "\\|")
+                      prob = fnd["problem"].replace("|", "\\|").replace("\n", " ")
+                      fix = fnd["fix"].replace("|", "\\|").replace("\n", " ")
+                      s.write(f"| {emoji} {sev} | {fnd['tool']} | `{loc}` | {prob} | {fix} |\n")
+                  if len(findings) > 25:
+                      s.write(f"\n_{len(findings) - 25} findings supplémentaires — voir les artifacts ou l'onglet Security._\n")
+                  s.write("\n")
+              else:
+                  s.write("## ✅ Aucun finding\n\nRien à signaler — score plein.\n\n")
+
               s.write("## Calcul du score\n\n")
               s.write("Base : 100. Pénalités : Critical -10 / High -5 / Medium -2 / Low -0.5.\n\n")
-              s.write("Voir l'onglet **Security** du repo pour les détails de chaque finding (SARIF).\n")
+              s.write("Voir l'onglet **Security** du repo pour la vue complète SARIF (clic vers le code).\n")
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as o:
               o.write(f"score={score}\n")

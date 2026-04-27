@@ -1,0 +1,72 @@
+name: Python CI (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: "Version de Python à utiliser"
+        required: false
+        type: string
+        default: "3.12"
+      run-docker-build:
+        description: "Builder le Dockerfile s'il existe"
+        required: false
+        type: boolean
+        default: true
+      run-lint:
+        description: "Lancer ruff (lint)"
+        required: false
+        type: boolean
+        default: true
+      run-tests:
+        description: "Lancer pytest"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  lint:
+    if: ${{ inputs.run-lint }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: Install ruff
+        run: pip install ruff
+      - name: Run ruff
+        run: ruff check .
+
+  test:
+    if: ${{ inputs.run-tests }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest
+      - name: Run pytest
+        run: pytest -v
+
+  docker-build:
+    if: ${{ inputs.run-docker-build }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Dockerfile exists
+        id: check
+        run: |
+          if [ -f Dockerfile ]; then
+            echo "found=true" >> $GITHUB_OUTPUT
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Build Docker image
+        if: steps.check.outputs.found == 'true'
+        run: docker build -t ${{ github.event.repository.name }}:ci .

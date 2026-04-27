@@ -158,23 +158,26 @@ jobs:
           SEV_EMOJI = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵"}
           counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
           per_tool = {}
-          findings = []  # list of dicts: tool, severity, location, problem, fix
-          # Applicabilité par scanner : "applicable" / "n/a" / "failed" / "clean"
-          # → calculée à la fin selon résultats + JSON
-          applicability = {}  # tool -> {"status": str, "reason": str}
+          findings = []        # findings actionnables (comptent dans le score)
+          unfixable = []       # CVE sans fix upstream (info, pas dans le score)
+          applicability = {}   # tool -> {"status": str, "reason": str}
 
-          def add(tool, sev, location="", problem="", fix=""):
+          def add(tool, sev, location="", problem="", fix="", actionable=True):
               sev = sev.upper()
               if sev not in counts:
                   return
-              counts[sev] += 1
-              per_tool.setdefault(tool, {"CRITICAL":0,"HIGH":0,"MEDIUM":0,"LOW":0})[sev] += 1
-              findings.append({
+              entry = {
                   "tool": tool, "severity": sev,
                   "location": location or "—",
                   "problem": (problem or "")[:120],
                   "fix": (fix or "")[:120],
-              })
+              }
+              if not actionable:
+                  unfixable.append(entry)
+                  return
+              counts[sev] += 1
+              per_tool.setdefault(tool, {"CRITICAL":0,"HIGH":0,"MEDIUM":0,"LOW":0})[sev] += 1
+              findings.append(entry)
 
           # Trivy FS — vulns dans les deps + misconfig (Dockerfile, IaC...)
           tfs_seen = False
@@ -190,8 +193,10 @@ jobs:
                       for v in r.get("Vulnerabilities", []) or []:
                           loc = f"{target} → {v.get('PkgName','?')} {v.get('InstalledVersion','')}"
                           prob = f"{v.get('VulnerabilityID','?')} — {v.get('Title') or v.get('Description','')}"
-                          fix = f"Mettre à jour vers {v.get('FixedVersion','(pas de fix)')}"
-                          add("Trivy FS", v.get("Severity","LOW"), loc, prob, fix)
+                          fixed = v.get("FixedVersion") or ""
+                          actionable = bool(fixed)
+                          fix = f"Mettre à jour vers {fixed}" if actionable else "Pas de fix upstream — CVE non-actionnable"
+                          add("Trivy FS", v.get("Severity","LOW"), loc, prob, fix, actionable)
                       for m in r.get("Misconfigurations", []) or []:
                           loc = f"{target}:{(m.get('CauseMetadata') or {}).get('StartLine','?')}"
                           prob = f"{m.get('ID','?')} — {m.get('Title','')}"
@@ -218,8 +223,10 @@ jobs:
                       for v in r.get("Vulnerabilities", []) or []:
                           loc = f"{v.get('PkgName','?')} {v.get('InstalledVersion','')} (image)"
                           prob = f"{v.get('VulnerabilityID','?')} — {v.get('Title') or v.get('Description','')}"
-                          fix = f"Mettre à jour vers {v.get('FixedVersion','(pas de fix)')}"
-                          add("Trivy Docker", v.get("Severity","LOW"), loc, prob, fix)
+                          fixed = v.get("FixedVersion") or ""
+                          actionable = bool(fixed)
+                          fix = f"Mettre à jour vers {fixed}" if actionable else "Pas de fix upstream — CVE non-actionnable"
+                          add("Trivy Docker", v.get("Severity","LOW"), loc, prob, fix, actionable)
               except Exception as e:
                   print(f"trivy-docker parse error: {e}")
           if tdk_seen:
@@ -381,8 +388,29 @@ jobs:
               else:
                   s.write("## ✅ Aucun finding\n\nRien à signaler — score plein.\n\n")
 
+              # Section CVE non-actionnables (sans fix upstream)
+              if unfixable:
+                  unfix_counts = {"CRITICAL":0,"HIGH":0,"MEDIUM":0,"LOW":0}
+                  for u in unfixable:
+                      unfix_counts[u["severity"]] += 1
+                  total_unfix = sum(unfix_counts.values())
+                  s.write(f"## ℹ️ {total_unfix} CVE non-actionnables (exclues du score)\n\n")
+                  s.write(f"Sans fix upstream disponible (Critical: {unfix_counts['CRITICAL']}, ")
+                  s.write(f"High: {unfix_counts['HIGH']}, Medium: {unfix_counts['MEDIUM']}, Low: {unfix_counts['LOW']}). ")
+                  s.write("Tu ne peux rien y faire tant que le mainteneur upstream (Debian, Alpine...) ne publie pas de patch. ")
+                  s.write("Solutions : changer d'image de base, ou accepter le risque résiduel.\n\n")
+                  s.write("<details><summary>Voir les CVE non-actionnables</summary>\n\n")
+                  s.write("| | Outil | Emplacement | CVE |\n|---|---|---|---|\n")
+                  unfixable.sort(key=lambda x: SEV_RANK[x["severity"]])
+                  for u in unfixable[:30]:
+                      s.write(f"| {SEV_EMOJI[u['severity']]} {u['severity']} | {u['tool']} | `{u['location']}` | {u['problem']} |\n")
+                  if len(unfixable) > 30:
+                      s.write(f"\n_{len(unfixable) - 30} de plus dans les artifacts._\n")
+                  s.write("\n</details>\n\n")
+
               s.write("## Calcul du score\n\n")
               s.write("Base : 100. Pénalités : Critical -10 / High -5 / Medium -2 / Low -0.5.\n\n")
+              s.write("Les CVE **sans fix upstream** sont exclues du calcul (listées séparément si présentes).\n\n")
               s.write("Voir l'onglet **Security** du repo pour la vue complète SARIF (clic vers le code).\n")
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as o:

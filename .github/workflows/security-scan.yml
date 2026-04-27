@@ -159,6 +159,9 @@ jobs:
           counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
           per_tool = {}
           findings = []  # list of dicts: tool, severity, location, problem, fix
+          # Applicabilité par scanner : "applicable" / "n/a" / "failed" / "clean"
+          # → calculée à la fin selon résultats + JSON
+          applicability = {}  # tool -> {"status": str, "reason": str}
 
           def add(tool, sev, location="", problem="", fix=""):
               sev = sev.upper()
@@ -174,10 +177,15 @@ jobs:
               })
 
           # Trivy FS — vulns dans les deps + misconfig (Dockerfile, IaC...)
+          tfs_seen = False
+          tfs_targets = 0
           for f in glob.glob("reports/trivy-fs-report/trivy-fs.json"):
+              tfs_seen = True
               try:
                   data = json.load(open(f))
-                  for r in data.get("Results", []) or []:
+                  results = data.get("Results") or []
+                  tfs_targets = len(results)
+                  for r in results:
                       target = r.get("Target", "?")
                       for v in r.get("Vulnerabilities", []) or []:
                           loc = f"{target} → {v.get('PkgName','?')} {v.get('InstalledVersion','')}"
@@ -191,13 +199,22 @@ jobs:
                           add("Trivy FS", m.get("Severity","LOW"), loc, prob, fix)
               except Exception as e:
                   print(f"trivy-fs parse error: {e}")
+          if tfs_seen:
+              if tfs_targets == 0:
+                  applicability["Trivy FS"] = {"status": "n/a", "reason": "Aucun manifest de dépendances ni IaC à analyser"}
+              else:
+                  applicability["Trivy FS"] = {"status": "ran", "reason": f"{tfs_targets} cible(s) analysée(s)"}
 
           # Trivy Docker — CVE OS / libs dans l'image
+          tdk_seen = False
+          tdk_targets = 0
           for f in glob.glob("reports/trivy-docker-report/trivy-docker.json"):
+              tdk_seen = True
               try:
                   data = json.load(open(f))
-                  for r in data.get("Results", []) or []:
-                      target = r.get("Target", "image")
+                  results = data.get("Results") or []
+                  tdk_targets = len(results)
+                  for r in results:
                       for v in r.get("Vulnerabilities", []) or []:
                           loc = f"{v.get('PkgName','?')} {v.get('InstalledVersion','')} (image)"
                           prob = f"{v.get('VulnerabilityID','?')} — {v.get('Title') or v.get('Description','')}"
@@ -205,12 +222,22 @@ jobs:
                           add("Trivy Docker", v.get("Severity","LOW"), loc, prob, fix)
               except Exception as e:
                   print(f"trivy-docker parse error: {e}")
+          if tdk_seen:
+              if tdk_targets == 0:
+                  applicability["Trivy Docker"] = {"status": "n/a", "reason": "Pas de Dockerfile dans le repo"}
+              else:
+                  applicability["Trivy Docker"] = {"status": "ran", "reason": "Image Docker analysée"}
 
           # Semgrep — SAST avec fichier:ligne
           sev_map = {"ERROR": "HIGH", "WARNING": "MEDIUM", "INFO": "LOW"}
+          sg_seen = False
+          sg_scanned = 0
           for f in glob.glob("reports/semgrep-report/semgrep.json"):
+              sg_seen = True
               try:
                   data = json.load(open(f))
+                  paths = (data.get("paths") or {})
+                  sg_scanned = len(paths.get("scanned") or [])
                   for res in data.get("results", []) or []:
                       sev = sev_map.get(res.get("extra",{}).get("severity","INFO"), "LOW")
                       loc = f"{res.get('path','?')}:{(res.get('start') or {}).get('line','?')}"
@@ -221,6 +248,14 @@ jobs:
                       add("Semgrep", sev, loc, prob, fix)
               except Exception as e:
                   print(f"semgrep parse error: {e}")
+          if sg_seen:
+              if sg_scanned == 0:
+                  applicability["Semgrep"] = {"status": "n/a", "reason": "Aucun fichier source dans un langage supporté"}
+              else:
+                  applicability["Semgrep"] = {"status": "ran", "reason": f"{sg_scanned} fichier(s) scanné(s)"}
+
+          # Gitleaks — toujours applicable (scan git history)
+          applicability["Gitleaks"] = {"status": "ran", "reason": "Historique git toujours analysé"}
 
           # Gitleaks — secrets exposés (artefact "results.sarif" ou "gitleaks-report.json")
           for f in glob.glob("reports/**/gitleaks*.json", recursive=True) + glob.glob("reports/**/results.sarif", recursive=True):
@@ -285,13 +320,29 @@ jobs:
                   s.write(f"Vérifie l'onglet **Actions** pour comprendre l'erreur, puis relance.\n\n")
                   s.write(f"![score](https://img.shields.io/badge/security-incomplet-lightgrey)\n\n")
 
-              # Statut des scanners
+              # Statut des scanners — combine résultat job + applicabilité
               s.write("## Statut des scanners\n\n")
-              s.write("| Scanner | Statut |\n|---|---|\n")
-              status_emoji = {"success": "✅", "skipped": "⏭️", "failure": "❌", "cancelled": "🚫", "unknown": "❓"}
-              for name, st in job_status.items():
-                  s.write(f"| {name} | {status_emoji.get(st, '❓')} {st} |\n")
+              s.write("| Scanner | Statut | Détail |\n|---|---|---|\n")
+              for name, job_st in job_status.items():
+                  app = applicability.get(name, {"status": "?", "reason": ""})
+                  if job_st in ("failure", "cancelled"):
+                      icon, label = "❌", f"Échec ({job_st})"
+                      detail = "Voir les logs du job pour comprendre l'erreur"
+                  elif job_st == "skipped":
+                      icon, label = "⏭️", "Skip"
+                      detail = "Job désactivé via input du workflow"
+                  elif app["status"] == "n/a":
+                      icon, label = "⏭️", "Non applicable"
+                      detail = app["reason"]
+                  elif per_tool.get(name):
+                      icon, label = "⚠️", "Findings"
+                      detail = app["reason"]
+                  else:
+                      icon, label = "✅", "Clean"
+                      detail = app["reason"] or "Scanner exécuté, aucun finding"
+                  s.write(f"| {name} | {icon} {label} | {detail} |\n")
               s.write("\n")
+              s.write("> ✅ clean · ⚠️ findings · ⏭️ non applicable (n'impacte pas le score) · ❌ échec\n\n")
 
               s.write("## Findings par sévérité\n\n")
               s.write("```mermaid\n")

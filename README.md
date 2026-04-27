@@ -35,14 +35,27 @@ Base 100. Pénalités cumulées par finding :
 name: Security
 on: [push, pull_request]
 
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
 jobs:
   scan:
     uses: SiLaX49/workflows/.github/workflows/security-scan.yml@main
 ```
 
+> Le bloc `permissions` est **obligatoire** : un reusable workflow ne peut pas
+> hériter de plus de permissions que le workflow appelant.
+
 ### Avec options
 
 ```yaml
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
 jobs:
   scan:
     uses: SiLaX49/workflows/.github/workflows/security-scan.yml@main

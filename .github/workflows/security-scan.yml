@@ -45,7 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@master
         with:
           scan-type: fs
           scan-ref: .
@@ -55,7 +55,7 @@ jobs:
           ignore-unfixed: false
         continue-on-error: true
       - name: Trivy SARIF (Security tab)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@master
         with:
           scan-type: fs
           scan-ref: .
@@ -94,7 +94,7 @@ jobs:
         run: docker build -t local-scan:ci .
       - name: Trivy image scan
         if: steps.check.outputs.found == 'true'
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@master
         with:
           image-ref: local-scan:ci
           format: json
